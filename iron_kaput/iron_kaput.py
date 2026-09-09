@@ -43,7 +43,7 @@ SATURATION_COUNTER_LIMIT = 50  # trip point per ~10-read monitoring window -- em
                                 # on hardware under a genuinely loud/close source
 
 
-def circular_mean_sector(directions, round_result=True):
+def circular_mean_sector(directions, weights=None, round_result=True):
     """Circular mean of a list of sector positions (0..SECTOR_COUNT, floats or
     ints -- e.g. the sub-sector-interpolated values from subsector_interpolate()
     below), returned as a sector position in the same range.
@@ -55,16 +55,31 @@ def circular_mean_sector(directions, round_result=True):
     circle (mean of sin/cos, then atan2 back to an angle) so the 15->0
     wraparound is handled correctly.
 
+    `weights`, if given, must be a same-length list of non-negative numbers
+    (e.g. each reading's excess power over the noise floor) -- an unweighted
+    average over a whole window gives a near-silent/ambient reading exactly
+    as much say as a loud, on-target one, which dilutes/washes out the real
+    signal whenever only a few readings in the window actually came from the
+    source. Weighting lets every raw reading still contribute (so the result
+    stays smooth over the full window, unlike gating individual samples
+    in/out) while letting the loud, informative readings actually dominate.
+
     round_result=True (default) rounds to the nearest integer sector, for
     callers that need a discrete sector (e.g. the stepper control logic).
     Pass False to keep the continuous sub-sector value (e.g. for display).
     """
     sum_sin = 0.0
     sum_cos = 0.0
-    for d in directions:
-        angle = d * RAD_PER_SECTOR
-        sum_sin += math.sin(angle)
-        sum_cos += math.cos(angle)
+    if weights is None:
+        for d in directions:
+            angle = d * RAD_PER_SECTOR
+            sum_sin += math.sin(angle)
+            sum_cos += math.cos(angle)
+    else:
+        for d, w in zip(directions, weights):
+            angle = d * RAD_PER_SECTOR
+            sum_sin += w * math.sin(angle)
+            sum_cos += w * math.cos(angle)
     mean_angle = math.atan2(sum_sin, sum_cos)
     if mean_angle < 0:
         mean_angle += TWO_PI
@@ -217,18 +232,28 @@ while True:
 
     if update_treshould == 10:
 
-        window_has_signal = (noise_floor is not None) and (sum(powers) / len(powers) >= noise_floor * VAD_MARGIN)
+        window_avg_power = sum(powers) / len(powers)
+        window_has_signal = (noise_floor is not None) and (window_avg_power >= noise_floor * VAD_MARGIN)
         window_directions = directions
+        window_powers = powers
         directions = []
         powers = []
 
         if noise_floor is None:
             print("Calibrating noise floor... ({}/{})".format(len(noise_floor_warmup), NOISE_FLOOR_WARMUP_SAMPLES))
         elif window_has_signal:
+            # Weight each reading by its excess power over the noise floor,
+            # so the (usually few) loud, on-target readings in the window
+            # dominate the average instead of being diluted by the (usually
+            # more numerous) near-ambient ones -- an unweighted average over
+            # the full window gave every reading equal say regardless of
+            # whether it actually came from the source, which produced a
+            # smooth but wrong (noise-dominated) estimate.
+            weights = [max(0.0, p - noise_floor) for p in window_powers]
             # Continuous (sub-sector) value for display/degrees; a rounded
             # sector for the stepper control logic below, which only needs a
             # discrete "which way to turn" decision.
-            direction_f = circular_mean_sector(window_directions, round_result=False)
+            direction_f = circular_mean_sector(window_directions, weights=weights, round_result=False)
             direction = int(round(direction_f)) % SECTOR_COUNT
 
             if direction in LOCK_SECTORS:
@@ -250,8 +275,8 @@ while True:
             # Convert direction to degrees (each step is 22.5 degrees)
             degrees = direction_f * SECTOR_DEGREES
             APU.set_led(int(degrees), 2, 0)
-            print("Detected {} sound from: {:.1f}° (sector {}) - {} [{}] noise_floor={:.0f}".format(
-                voc_dir, degrees, direction, power, lock_state, noise_floor))
+            print("Detected {} sound from: {:.1f}° (sector {}) - avg_power={:.0f} [{}] noise_floor={:.0f}".format(
+                voc_dir, degrees, direction, window_avg_power, lock_state, noise_floor))
         else:
             # This window's average power didn't clear the noise floor --
             # hold position instead of steering toward a window that was
@@ -259,7 +284,8 @@ while True:
             # direction we no longer have signal evidence for.
             step_direction = 0
             APU.disable_voice_output()
-            print("No signal above noise floor ({:.0f}) -- holding".format(noise_floor))
+            print("No signal: avg_power={:.0f} < noise_floor={:.0f} * {} -- holding".format(
+                window_avg_power, noise_floor, VAD_MARGIN))
 
         update_treshould = 0
 
