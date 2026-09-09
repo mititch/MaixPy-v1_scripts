@@ -30,17 +30,23 @@ VAD_MARGIN = 3.0                 # power must exceed noise_floor * VAD_MARGIN to
 
 # Saturation/clip protection: loud sources up close (e.g. a drone/engine) can
 # clip the ADC front-end, corrupting both DOA and (later) classification.
-# APU.voc_get_saturation_counter() counts clipped samples since the last
-# reset -- if too many pile up in a monitoring window, back off the gain via
-# APU.init_apu() instead of continuing to feed clipped audio downstream.
+# APU.voc_get_saturation_counter()'s raw 32-bit value is PACKED, per the
+# vendor apu.c comment ("high 16 bit is counter, low 16 bit is total"): the
+# high 16 bits are the actual clipped-sample count, the low 16 bits are the
+# total samples counted since the last reset. Comparing the raw combined
+# value against a small threshold (an earlier version of this code did that)
+# mostly ends up comparing against the harmless "total" half, since the clip
+# half is usually 0 -- confirmed on hardware: it tripped on nearly every
+# window regardless of real clipping, collapsing gain to the floor within
+# seconds of every boot. Unpack it and gate on an actual clip *rate* instead.
 CHANNELS_MASK = 0x3F      # matches init_bf()'s own default channel-enable mask (6 ring mics) --
                           # not a new choice here, just what's already active; only gain changes
 INITIAL_GAIN = 1 << 10    # matches APU_AUDIO_GAIN_TEST, the default init_bf() already applies
 MIN_GAIN = 1 << 6         # floor -- don't let auto-backoff collapse gain to near-zero
 GAIN_BACKOFF_FACTOR = 0.7
-SATURATION_COUNTER_LIMIT = 50  # trip point per ~10-read monitoring window -- empirical starting
-                                # point, revisit once real saturation-counter behavior is observed
-                                # on hardware under a genuinely loud/close source
+SATURATION_CLIP_RATE_LIMIT = 0.05  # trip if >5% of a window's samples clipped -- empirical
+                                    # starting point, revisit once real clip-rate behavior is
+                                    # observed on hardware under a genuinely loud/close source
 
 
 def circular_mean_sector(directions, weights=None, round_result=True):
@@ -212,7 +218,13 @@ while True:
         # Still calibrating -- collect samples, don't gate/steer yet.
         noise_floor_warmup.append(power)
         if len(noise_floor_warmup) >= NOISE_FLOOR_WARMUP_SAMPLES:
-            noise_floor = sum(noise_floor_warmup) / len(noise_floor_warmup)
+            # Median, not mean -- the very first reads after boot can be a huge
+            # startup transient (observed on hardware: a multi-million seed that
+            # then took dozens of seconds to grind back down via the EMA below).
+            # A plain mean isn't robust to a couple of extreme outlier samples;
+            # the median is, as long as fewer than half the warmup samples are
+            # affected.
+            noise_floor = sorted(noise_floor_warmup)[len(noise_floor_warmup) // 2]
     else:
         if power < noise_floor * VAD_MARGIN:
             # Ambient/quiet reading -- slowly adapt the floor toward it so a
@@ -293,12 +305,19 @@ while True:
         # gate above, since clipping is a front-end/hardware condition, not
         # something that depends on whether this particular window had a
         # confirmed direction.
-        sat_count = APU.voc_get_saturation_counter()
-        if sat_count > SATURATION_COUNTER_LIMIT and current_gain > MIN_GAIN:
-            current_gain = max(MIN_GAIN, int(current_gain * GAIN_BACKOFF_FACTOR))
-            APU.init_apu(current_gain, CHANNELS_MASK)
-            print("Saturation counter {} > {} -- reduced gain to {}".format(
-                sat_count, SATURATION_COUNTER_LIMIT, current_gain))
+        raw_sat = APU.voc_get_saturation_counter()
+        clip_count = (raw_sat >> 16) & 0xFFFF
+        total_count = raw_sat & 0xFFFF
+        if total_count > 0:
+            clip_rate = clip_count / total_count
+            if clip_rate > SATURATION_CLIP_RATE_LIMIT and current_gain > MIN_GAIN:
+                current_gain = max(MIN_GAIN, int(current_gain * GAIN_BACKOFF_FACTOR))
+                APU.init_apu(current_gain, CHANNELS_MASK)
+                # "%" presentation type ({:.1%}) isn't reliably supported by
+                # MicroPython's reduced str.format() -- compute the percentage
+                # manually instead.
+                print("Clip rate {:.1f}% ({}/{}) -- reduced gain to {}".format(
+                    clip_rate * 100.0, clip_count, total_count, current_gain))
         APU.voc_reset_saturation_counter()
 
         # Visualize (runs every window regardless of VAD gate, using this
