@@ -29,17 +29,20 @@ NOISE_FLOOR_EMA_ALPHA = 0.15     # adaptation rate applied once per "quiet" wind
                                   # track ambient drift (e.g. wind) without chasing transient signal
 VAD_MARGIN = 3.0                 # power must exceed noise_floor * VAD_MARGIN to count as signal
 
-# Stopping the stepper (step_direction = 0) on every single quiet window --
-# confirmed on hardware to make the platform twitch/stall instead of turning
-# smoothly: a geared stepper like the 28BYJ-48 needs a sustained step train to
-# build up enough torque against static friction, and repeatedly killing it
-# after only a few steps then restarting from a dead stop prevents that. The
-# original baseline never stops the motor at all (step_direction is always
-# +-1) and does rotate, if imperfectly -- this hysteresis lets brief, normal
-# signal dips coast through on the previous step_direction instead of
-# stopping immediately, only actually holding after several windows in a row
-# were quiet.
-HOLD_AFTER_CONSECUTIVE_QUIET_WINDOWS = 3
+# Stopping the stepper (step_direction = 0) on a quiet/VAD-gated window --
+# confirmed on hardware (even with 3-window hysteresis) to leave the motor
+# stopped for a large fraction of total runtime, which on an already slow,
+# cheap motor means negligible net rotation over any reasonable test. The
+# original baseline never stops the motor for this reason at all -- it always
+# recomputes step_direction from whatever the last 10 raw readings implied
+# and keeps driving continuously (100% duty cycle), letting stale/noisy
+# readings persist through quiet stretches rather than actively holding.
+# Matching that: a quiet window here doesn't touch step_direction at all --
+# it just coasts on whatever the last confirmed direction commanded, for as
+# long as it takes for real signal to return. LOCK_SECTORS (genuine
+# alignment/convergence) is the only thing that should ever deliberately stop
+# the motor -- that's a real improvement over the baseline, not something to
+# roll back.
 
 # Saturation/clip protection: loud sources up close (e.g. a drone/engine) can
 # clip the ADC front-end, corrupting both DOA and (later) classification.
@@ -210,7 +213,6 @@ tim.start()
 
 directions = [] # Store the last 10 raw sub-sector readings (always -- see VAD note below)
 powers = []      # Parallel list of each reading's `power`, for the window-level VAD gate
-consecutive_quiet_windows = 0  # hysteresis counter -- see HOLD_AFTER_CONSECUTIVE_QUIET_WINDOWS above
 
 # Adaptive noise floor for the power-gated VAD. Starts uncalibrated (None) and
 # is seeded from the average of the first NOISE_FLOOR_WARMUP_SAMPLES readings
@@ -288,7 +290,6 @@ while True:
             # discrete "which way to turn" decision.
             direction_f = circular_mean_sector(window_directions, weights=weights, round_result=False)
             direction = int(round(direction_f)) % SECTOR_COUNT
-            consecutive_quiet_windows = 0
 
             if direction in LOCK_SECTORS:
                 step_direction = 0
@@ -313,28 +314,23 @@ while True:
                 voc_dir, degrees, direction, window_avg_power, lock_state, noise_floor))
         else:
             # This window's average power didn't clear the noise floor.
-            # Voice-output beamforming stops immediately either way -- no
-            # motor-momentum concern there, and we no longer have signal
-            # evidence for the direction it was pointed at. The *stepper*,
-            # though, only actually holds after several consecutive quiet
-            # windows (see HOLD_AFTER_CONSECUTIVE_QUIET_WINDOWS) -- coasting
-            # on the previous step_direction through a single brief, normal
-            # dip instead of killing the motor's momentum every time.
+            # Voice-output beamforming stops immediately -- no motor-momentum
+            # concern there, and we no longer have signal evidence for the
+            # direction it was pointed at. step_direction is deliberately left
+            # untouched: matching the baseline's actual behavior (it never
+            # stops the motor at all), the stepper just keeps doing whatever
+            # it was last confirmed to do until real signal returns, rather
+            # than actively holding on a quiet window. LOCK_SECTORS above is
+            # the only place that intentionally stops it.
             APU.disable_voice_output()
-            consecutive_quiet_windows += 1
-            if consecutive_quiet_windows >= HOLD_AFTER_CONSECUTIVE_QUIET_WINDOWS:
-                step_direction = 0
-                hold_state = "holding"
-            else:
-                hold_state = "coasting"
             # Safe to adapt here: the *whole window* was judged quiet, so this
             # can't be the source of the upward-chasing feedback loop the old
             # per-sample update caused. (noise_floor is guaranteed set by this
             # point -- the `noise_floor is None` branch above already handled
             # the still-calibrating case.)
             noise_floor += (window_avg_power - noise_floor) * NOISE_FLOOR_EMA_ALPHA
-            print("No signal: avg_power={:.0f} < noise_floor={:.0f} * {} -- {}".format(
-                window_avg_power, noise_floor, VAD_MARGIN, hold_state))
+            print("No signal: avg_power={:.0f} < noise_floor={:.0f} * {} -- coasting".format(
+                window_avg_power, noise_floor, VAD_MARGIN))
 
         update_treshould = 0
 
