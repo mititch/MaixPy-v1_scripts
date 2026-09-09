@@ -13,36 +13,24 @@ SECTOR_DEGREES = 360.0 / SECTOR_COUNT  # 22.5
 TWO_PI = 2 * math.pi
 RAD_PER_SECTOR = TWO_PI / SECTOR_COUNT
 
-# Sectors treated as "aligned" -- step_direction is held at 0 here instead of
-# always +-1, so the platform settles once it's close to dead-ahead instead of
-# perpetually hunting across the 15/0 boundary. Must stay centered on sector 0
-# (dead ahead) for the lock check below to make sense.
-LOCK_SECTORS = (15, 0, 1)
-
-# Power-gated VAD (voice/signal-activity detection): only treat a reading as a
-# real direction if its `power` clears the adaptive noise floor by this
-# margin; otherwise it's ambient noise and shouldn't move the stepper or be
-# averaged into the direction estimate.
+# Power-gated VAD (voice/signal-activity detection): used only to decide
+# whether to beamform voice output toward the current direction estimate
+# (see the window-level block below) -- NOT to gate or stop the stepper.
+# Earlier versions of this script also used this to skip recomputing the
+# direction, and separately had a LOCK_SECTORS deadband that zeroed
+# step_direction when "aligned". Both, confirmed on hardware, could leave
+# step_direction stuck at a stale value for long stretches once the
+# environment went quiet, since nothing recomputed it until a later window
+# both cleared the VAD gate and landed outside the deadband -- on the user's
+# motor (mechanically slow even when driven continuously), that produced
+# negligible net rotation. The stepper decision below now matches the
+# original baseline exactly: always recompute, always drive +-1, every
+# window, unconditionally, never stopping on its own.
 NOISE_FLOOR_WARMUP_SAMPLES = 20  # readings collected before the floor has a valid initial estimate
 NOISE_FLOOR_EMA_ALPHA = 0.15     # adaptation rate applied once per "quiet" window (not per-sample --
                                   # see the note by the window-level update below) -- slow enough to
                                   # track ambient drift (e.g. wind) without chasing transient signal
 VAD_MARGIN = 3.0                 # power must exceed noise_floor * VAD_MARGIN to count as signal
-
-# Stopping the stepper (step_direction = 0) on a quiet/VAD-gated window --
-# confirmed on hardware (even with 3-window hysteresis) to leave the motor
-# stopped for a large fraction of total runtime, which on an already slow,
-# cheap motor means negligible net rotation over any reasonable test. The
-# original baseline never stops the motor for this reason at all -- it always
-# recomputes step_direction from whatever the last 10 raw readings implied
-# and keeps driving continuously (100% duty cycle), letting stale/noisy
-# readings persist through quiet stretches rather than actively holding.
-# Matching that: a quiet window here doesn't touch step_direction at all --
-# it just coasts on whatever the last confirmed direction commanded, for as
-# long as it takes for real signal to return. LOCK_SECTORS (genuine
-# alignment/convergence) is the only thing that should ever deliberately stop
-# the motor -- that's a real improvement over the baseline, not something to
-# roll back.
 
 # Saturation/clip protection: loud sources up close (e.g. a drone/engine) can
 # clip the ADC front-end, corrupting both DOA and (later) classification.
@@ -270,67 +258,55 @@ while True:
         window_avg_power = sum(powers) / len(powers)
         window_has_signal = (noise_floor is not None) and (window_avg_power >= noise_floor * VAD_MARGIN)
         window_directions = directions
-        window_powers = powers
         directions = []
         powers = []
+
+        # Stepper decision: ALWAYS recompute and ALWAYS drive, every window,
+        # unconditionally -- matching the original baseline exactly (it never
+        # skips a window and never sets step_direction to 0; step_direction is
+        # always +-1). Earlier versions of this script gated this decision on
+        # VAD (skip when quiet) and/or a LOCK_SECTORS deadband (stop when
+        # aligned) -- both, confirmed on hardware, could leave step_direction
+        # stuck at a stale value (0, in the deadband case) for long stretches
+        # whenever the environment went quiet afterward, since nothing
+        # recomputes it until a later window both clears the VAD gate and
+        # lands outside the deadband. On the user's motor (mechanically slow
+        # even when driven continuously), that produced negligible net
+        # rotation. Plain, unweighted circular mean here (not power-weighted)
+        # for the same reason baseline used a plain average: weighting by
+        # excess-over-noise-floor degenerates toward a spurious "sector 0"
+        # result when every sample in a quiet window is near the floor, which
+        # would corrupt the direction on exactly the windows this now has to
+        # act on unconditionally.
+        direction_f = circular_mean_sector(window_directions, round_result=False)
+        direction = int(round(direction_f)) % SECTOR_COUNT
+        step_direction = 1 if direction < 8 else -1
+
+        # Convert direction to degrees (each step is 22.5 degrees)
+        degrees = direction_f * SECTOR_DEGREES
+        APU.set_led(int(degrees), 2, 0)
 
         if noise_floor is None:
             print("Calibrating noise floor... ({}/{})".format(len(noise_floor_warmup), NOISE_FLOOR_WARMUP_SAMPLES))
         elif window_has_signal:
-            # Weight each reading by its excess power over the noise floor,
-            # so the (usually few) loud, on-target readings in the window
-            # dominate the average instead of being diluted by the (usually
-            # more numerous) near-ambient ones -- an unweighted average over
-            # the full window gave every reading equal say regardless of
-            # whether it actually came from the source, which produced a
-            # smooth but wrong (noise-dominated) estimate.
-            weights = [max(0.0, p - noise_floor) for p in window_powers]
-            # Continuous (sub-sector) value for display/degrees; a rounded
-            # sector for the stepper control logic below, which only needs a
-            # discrete "which way to turn" decision.
-            direction_f = circular_mean_sector(window_directions, weights=weights, round_result=False)
-            direction = int(round(direction_f)) % SECTOR_COUNT
-
-            if direction in LOCK_SECTORS:
-                step_direction = 0
-                lock_state = "locked"
-            elif direction < 8:
-                step_direction = 1
-                lock_state = "tracking"
-            else:
-                step_direction = -1
-                lock_state = "tracking"
-
             # Point the hardware beamformer at the confirmed direction, so
             # voc_samples becomes a beamformed, SNR-boosted signal aimed at
             # the target instead of a raw omni sum -- this is what
-            # classification (§2) should consume.
+            # classification (§2) should consume. Gated on VAD (unlike the
+            # stepper decision above) since there's no motor-momentum
+            # downside to skipping this on a window that's likely pure noise.
             APU.enable_voice_output(direction)
-
-            # Convert direction to degrees (each step is 22.5 degrees)
-            degrees = direction_f * SECTOR_DEGREES
-            APU.set_led(int(degrees), 2, 0)
-            print("Detected {} sound from: {:.1f}° (sector {}) - avg_power={:.0f} [{}] noise_floor={:.0f}".format(
-                voc_dir, degrees, direction, window_avg_power, lock_state, noise_floor))
+            print("Detected {} sound from: {:.1f}° (sector {}) - avg_power={:.0f} noise_floor={:.0f}".format(
+                voc_dir, degrees, direction, window_avg_power, noise_floor))
         else:
-            # This window's average power didn't clear the noise floor.
-            # Voice-output beamforming stops immediately -- no motor-momentum
-            # concern there, and we no longer have signal evidence for the
-            # direction it was pointed at. step_direction is deliberately left
-            # untouched: matching the baseline's actual behavior (it never
-            # stops the motor at all), the stepper just keeps doing whatever
-            # it was last confirmed to do until real signal returns, rather
-            # than actively holding on a quiet window. LOCK_SECTORS above is
-            # the only place that intentionally stops it.
             APU.disable_voice_output()
-            # Safe to adapt here: the *whole window* was judged quiet, so this
-            # can't be the source of the upward-chasing feedback loop the old
-            # per-sample update caused. (noise_floor is guaranteed set by this
-            # point -- the `noise_floor is None` branch above already handled
-            # the still-calibrating case.)
-            noise_floor += (window_avg_power - noise_floor) * NOISE_FLOOR_EMA_ALPHA
-            print("No signal: avg_power={:.0f} < noise_floor={:.0f} * {} -- coasting".format(
-                window_avg_power, noise_floor, VAD_MARGIN))
+            if noise_floor is not None:
+                # Safe to adapt here: the *whole window* was judged quiet, so
+                # this can't be the source of the upward-chasing feedback loop
+                # the old per-sample update caused.
+                noise_floor += (window_avg_power - noise_floor) * NOISE_FLOOR_EMA_ALPHA
+                print("No signal: avg_power={:.0f} < noise_floor={:.0f} * {} -- driving on last estimate".format(
+                    window_avg_power, noise_floor, VAD_MARGIN))
 
         update_treshould = 0
 
