@@ -37,7 +37,10 @@ time.sleep_ms(500)
 img = image.Image()
 
 while True:
-    direction, power, voc_dir, samples, voc_samples = APU.get_direction()
+    # APU.get_direction() now returns a 6th element, sector_power (16-int list, one entry per
+    # direction sector) -- added for future sub-sector interpolation. Not used by this script yet;
+    # accepted here only so the unpack doesn't fail.
+    direction, power, voc_dir, samples, voc_samples, sector_power = APU.get_direction()
     # Convert direction to degrees (each step is 22.5 degrees)
     if show == 10:
         degrees = direction * 22.5

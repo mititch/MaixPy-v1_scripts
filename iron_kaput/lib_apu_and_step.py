@@ -86,7 +86,10 @@ directions = [] # Store the last 10 directions
 
 while True:
 
-    detect_dir, power, voc_dir, samples, voc_samples = APU.get_direction()
+    # APU.get_direction() now returns a 6th element, sector_power (16-int list, one entry per
+    # direction sector) -- added for future sub-sector interpolation. Not used by this script yet;
+    # accepted here only so the unpack doesn't fail.
+    detect_dir, power, voc_dir, samples, voc_samples, sector_power = APU.get_direction()
 
     directions.append(detect_dir)
 
