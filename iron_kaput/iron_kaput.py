@@ -174,7 +174,8 @@ img = image.Image()
 
 tim.start()
 
-directions = [] # Store the last 10 directions (only ones that pass the VAD gate below)
+directions = [] # Store the last 10 raw sub-sector readings (always -- see VAD note below)
+powers = []      # Parallel list of each reading's `power`, for the window-level VAD gate
 
 # Adaptive noise floor for the power-gated VAD. Starts uncalibrated (None) and
 # is seeded from the average of the first NOISE_FLOOR_WARMUP_SAMPLES readings
@@ -197,28 +198,38 @@ while True:
         noise_floor_warmup.append(power)
         if len(noise_floor_warmup) >= NOISE_FLOOR_WARMUP_SAMPLES:
             noise_floor = sum(noise_floor_warmup) / len(noise_floor_warmup)
-        has_signal = False
     else:
-        has_signal = power >= noise_floor * VAD_MARGIN
-        if not has_signal:
+        if power < noise_floor * VAD_MARGIN:
             # Ambient/quiet reading -- slowly adapt the floor toward it so a
             # drifting background level doesn't leave a stale threshold.
             noise_floor += (power - noise_floor) * NOISE_FLOOR_EMA_ALPHA
 
-    if has_signal:
-        directions.append(subsector_interpolate(detect_dir, sector_power))
+    # Always accumulate every raw reading, regardless of this single sample's
+    # power -- matches the original baseline's behavior (it averaged all 10
+    # raw reads unconditionally). VAD gating happens below at the *window*
+    # level (average power over the whole window vs. threshold), not here
+    # per-sample: gating per-sample left as few as 0-2 (often noisy/outlier)
+    # readings to average per window, which produced an unsmoothed, jumpy
+    # direction estimate instead of the intended smooth tracking -- averaging
+    # over all 10 reads is what actually produces a stable estimate.
+    directions.append(subsector_interpolate(detect_dir, sector_power))
+    powers.append(power)
 
     if update_treshould == 10:
 
+        window_has_signal = (noise_floor is not None) and (sum(powers) / len(powers) >= noise_floor * VAD_MARGIN)
+        window_directions = directions
+        directions = []
+        powers = []
+
         if noise_floor is None:
             print("Calibrating noise floor... ({}/{})".format(len(noise_floor_warmup), NOISE_FLOOR_WARMUP_SAMPLES))
-        elif directions:
+        elif window_has_signal:
             # Continuous (sub-sector) value for display/degrees; a rounded
             # sector for the stepper control logic below, which only needs a
             # discrete "which way to turn" decision.
-            direction_f = circular_mean_sector(directions, round_result=False)
+            direction_f = circular_mean_sector(window_directions, round_result=False)
             direction = int(round(direction_f)) % SECTOR_COUNT
-            directions = []
 
             if direction in LOCK_SECTORS:
                 step_direction = 0
@@ -242,11 +253,10 @@ while True:
             print("Detected {} sound from: {:.1f}° (sector {}) - {} [{}] noise_floor={:.0f}".format(
                 voc_dir, degrees, direction, power, lock_state, noise_floor))
         else:
-            # No reading in this window cleared the VAD gate -- hold position
-            # instead of computing a direction from an empty buffer (which
-            # would otherwise resolve to a phantom sector 0 / "locked"), and
-            # stop beamforming toward a direction we no longer have signal
-            # evidence for.
+            # This window's average power didn't clear the noise floor --
+            # hold position instead of steering toward a window that was
+            # mostly/entirely ambient noise, and stop beamforming toward a
+            # direction we no longer have signal evidence for.
             step_direction = 0
             APU.disable_voice_output()
             print("No signal above noise floor ({:.0f}) -- holding".format(noise_floor))
