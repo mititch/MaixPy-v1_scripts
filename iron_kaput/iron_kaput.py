@@ -24,8 +24,9 @@ LOCK_SECTORS = (15, 0, 1)
 # margin; otherwise it's ambient noise and shouldn't move the stepper or be
 # averaged into the direction estimate.
 NOISE_FLOOR_WARMUP_SAMPLES = 20  # readings collected before the floor has a valid initial estimate
-NOISE_FLOOR_EMA_ALPHA = 0.02     # adaptation rate for "quiet" readings afterward -- slow, tracks
-                                  # ambient drift (e.g. wind) rather than reacting to transient signal
+NOISE_FLOOR_EMA_ALPHA = 0.15     # adaptation rate applied once per "quiet" window (not per-sample --
+                                  # see the note by the window-level update below) -- slow enough to
+                                  # track ambient drift (e.g. wind) without chasing transient signal
 VAD_MARGIN = 3.0                 # power must exceed noise_floor * VAD_MARGIN to count as signal
 
 # Saturation/clip protection: loud sources up close (e.g. a drone/engine) can
@@ -225,11 +226,18 @@ while True:
             # the median is, as long as fewer than half the warmup samples are
             # affected.
             noise_floor = sorted(noise_floor_warmup)[len(noise_floor_warmup) // 2]
-    else:
-        if power < noise_floor * VAD_MARGIN:
-            # Ambient/quiet reading -- slowly adapt the floor toward it so a
-            # drifting background level doesn't leave a stale threshold.
-            noise_floor += (power - noise_floor) * NOISE_FLOOR_EMA_ALPHA
+
+    # Note: the noise floor is NOT adapted here per-sample anymore -- see the
+    # window-level update below. Adapting per-sample (against a permissive
+    # per-sample threshold) let the floor chase a genuinely active source
+    # upward: individual samples inside a real, sustained signal easily read
+    # below noise_floor*VAD_MARGIN too, especially once the floor had already
+    # crept up a little, so the floor kept climbing to meet the signal instead
+    # of tracking true ambient silence -- confirmed on hardware: noise_floor
+    # rose continuously through several straight "tracking" windows, and
+    # eventually required an enormous power spike to ever register as signal
+    # again. Only ever adapting from whole windows the system judged quiet
+    # breaks that feedback loop.
 
     # Always accumulate every raw reading, regardless of this single sample's
     # power -- matches the original baseline's behavior (it averaged all 10
@@ -296,6 +304,12 @@ while True:
             # direction we no longer have signal evidence for.
             step_direction = 0
             APU.disable_voice_output()
+            # Safe to adapt here: the *whole window* was judged quiet, so this
+            # can't be the source of the upward-chasing feedback loop the old
+            # per-sample update caused. (noise_floor is guaranteed set by this
+            # point -- the `noise_floor is None` branch above already handled
+            # the still-calibrating case.)
+            noise_floor += (window_avg_power - noise_floor) * NOISE_FLOOR_EMA_ALPHA
             print("No signal: avg_power={:.0f} < noise_floor={:.0f} * {} -- holding".format(
                 window_avg_power, noise_floor, VAD_MARGIN))
 
