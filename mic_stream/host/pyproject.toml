@@ -1,0 +1,21 @@
+[project]
+name = "mic-stream-host"
+version = "0.1.0"
+description = "PC-side host tools for the K210 mic_stream dashboard (dashboard.py, record_wav.py, monitor.py)"
+requires-python = ">=3.10,<3.13"  # PyQt5 has no wheel for 3.13+ at time of writing;
+                                  # `uv sync` fetches a compatible interpreter
+                                  # automatically, no manual venv juggling needed
+dependencies = [
+    "pyserial>=3.5",
+    "sounddevice>=0.4",
+    "numpy>=1.26",
+    "PyQt5==5.15.10",
+    "PyQt5-Qt5==5.15.2",  # pinned: PyQt5's own dependency range resolves to a
+                            # newer PyQt5-Qt5 release with no win_amd64 wheel;
+                            # this older one has Windows wheels for every arch
+    "pyqtgraph>=0.13",
+    "matplotlib>=3.8",
+]
+
+[tool.uv]
+package = false  # this is a script collection, not an importable/publishable package
